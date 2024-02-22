@@ -3,7 +3,7 @@
 #
 #   The MIT License (MIT)
 #
-#   Copyright (C) 2021 Joe Testa (jtesta@positronsecurity.com)
+#   Copyright (C) 2021-2024 Joe Testa (jtesta@positronsecurity.com)
 #
 #   Permission is hereby granted, free of charge, to any person obtaining a copy
 #   of this software and associated documentation files (the "Software"), to deal
@@ -34,10 +34,10 @@
 PLATFORM="$(uname -s)"
 
 # This script is intended for use on Cygwin only.
-case "$PLATFORM" in
+case "${PLATFORM}" in
     CYGWIN*) ;;
     *)
-    echo "Platform not supported ($PLATFORM).  This must be run in Cygwin only."
+    echo "Platform not supported (${PLATFORM}).  This must be run in Cygwin only."
     exit 1
     ;;
 esac
@@ -48,15 +48,10 @@ if [[ "$(python -V)" != "Python 3."* ]]; then
     exit 1
 fi
 
-# Ensure that pyinstaller is installed.
-command -v pyinstaller >/dev/null 2>&1 || { echo >&2 "pyinstaller not found.  Install with: 'pip install pyinstaller'"; exit 1; }
-
-# Ensure that the colorama module is installed.
-X=$(pip show colorama 2>/dev/null)
-if [[ $? != 0 ]]; then
-    echo "Colorama module not found.  Install with: 'pip install colorama'"
-    exit 1
-fi
+# Install/update package dependencies.
+echo "Installing/updating pyinstaller and colorama packages..."
+pip install -U pyinstaller colorama
+echo
 
 # Prompt for the version to release.
 echo -n "Enter the version to release, using format 'vX.X.X': "
@@ -82,14 +77,15 @@ fi
 git checkout src/ssh_audit/globals.py 2> /dev/null
 
 # Update the man page.
-./update_windows_man_page.sh
-if [[ $? != 0 ]]; then
+./add_builtin_man_page.sh
+retval=$?
+if [[ ${retval} != 0 ]]; then
     echo "Failed to run ./update_windows_man_page.sh"
     exit 1
 fi
 
 # Do all operations from this point from the main source directory.
-pushd src/ssh_audit > /dev/null
+pushd src/ssh_audit || exit > /dev/null
 
 # Delete the existing VERSION variable and add the value that the user entered, above.
 sed -i '/^VERSION/d' globals.py
@@ -114,8 +110,9 @@ else
 fi
 
 # Ensure that the version string doesn't have '-dev' in it.
-X=`dist/ssh-audit.exe | grep -E 'ssh-audit.exe v.+\-dev'` > /dev/null
-if [[ $? == 0 ]]; then
+dist/ssh-audit.exe | grep -E 'ssh-audit.exe v.+\-dev' > /dev/null
+retval=$?
+if [[ ${retval} == 0 ]]; then
     echo -e "\nError: executable's version number includes '-dev'."
     exit 1
 fi
@@ -126,5 +123,5 @@ rm -rf build/ ssh-audit.spec ssh-audit.py
 # Reset the changes we made to globals.py.
 git checkout globals.py 2> /dev/null
 
-popd > /dev/null
+popd || exit > /dev/null
 exit 0

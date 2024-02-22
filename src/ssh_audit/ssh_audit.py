@@ -34,12 +34,12 @@ import traceback
 
 # pylint: disable=unused-import
 from typing import Dict, List, Set, Sequence, Tuple, Iterable  # noqa: F401
-from typing import Callable, Optional, Union, Any  # noqa: F401
+from typing import cast, Callable, Optional, Union, Any  # noqa: F401
 
 from ssh_audit.globals import SNAP_PACKAGE
 from ssh_audit.globals import SNAP_PERMISSIONS_ERROR
 from ssh_audit.globals import VERSION
-from ssh_audit.globals import WINDOWS_MAN_PAGE
+from ssh_audit.globals import BUILTIN_MAN_PAGE
 from ssh_audit.algorithm import Algorithm
 from ssh_audit.algorithms import Algorithms
 from ssh_audit.auditconf import AuditConf
@@ -61,13 +61,24 @@ from ssh_audit.ssh_socket import SSH_Socket
 from ssh_audit.utils import Utils
 from ssh_audit.versionvulnerabilitydb import VersionVulnerabilityDB
 
+
+# no_idna_workaround = False
+
 # Only import colorama under Windows.  Other OSes can natively handle terminal colors.
 if sys.platform == 'win32':
     try:
-        from colorama import init as colorama_init
-        colorama_init()
+        from colorama import just_fix_windows_console
+        just_fix_windows_console()
     except ImportError:
         pass
+
+    # This is a workaround for a Python bug that causes a crash on Windows when multiple threads are used (see https://github.com/python/cpython/issues/73474).  Importing the idna module and using it in a no-op seems to fix the issue.  Otherwise, if idna isn't available at run-time, force single threaded scans.
+    # try:
+    #     import idna  # noqa: F401
+    #
+    #     ''.encode('idna')
+    # except ImportError:
+    #     no_idna_workaround = True
 
 
 def usage(uout: OutputBuffer, err: Optional[str] = None) -> None:
@@ -95,7 +106,8 @@ def usage(uout: OutputBuffer, err: Optional[str] = None) -> None:
     uout.info('        --lookup=<alg1,alg2,...>    looks up an algorithm(s) without\n                                    connecting to a server')
     uout.info('   -M,  --make-policy=<policy.txt>  creates a policy based on the target server\n                                    (i.e.: the target server has the ideal\n                                    configuration that other servers should\n                                    adhere to)')
     uout.info('   -m,  --manual           print the man page (Windows only)')
-    uout.info('   -n,  --no-colors        disable colors')
+    uout.info('   -n,  --no-colors        disable colors (automatic when the NO_COLOR')
+    uout.info('                                  environment variable is set)')
     uout.info('   -p,  --port=<port>      port to connect')
     uout.info('   -P,  --policy=<policy.txt>  run a policy test using the specified policy')
     uout.info('   -t,  --timeout=<secs>   timeout (in seconds) for connection and reading\n                               (default: 5)')
@@ -107,10 +119,10 @@ def usage(uout: OutputBuffer, err: Optional[str] = None) -> None:
     sys.exit(retval)
 
 
-def output_algorithms(out: OutputBuffer, title: str, alg_db: Dict[str, Dict[str, List[List[Optional[str]]]]], alg_type: str, algorithms: List[str], unknown_algs: List[str], is_json_output: bool, program_retval: int, maxlen: int = 0, alg_sizes: Optional[Dict[str, Tuple[int, int]]] = None) -> int:  # pylint: disable=too-many-arguments
+def output_algorithms(out: OutputBuffer, title: str, alg_db: Dict[str, Dict[str, List[List[Optional[str]]]]], alg_type: str, algorithms: List[str], unknown_algs: List[str], is_json_output: bool, program_retval: int, maxlen: int = 0, host_keys: Optional[Dict[str, Dict[str, Union[bytes, str, int]]]] = None, dh_modulus_sizes: Optional[Dict[str, int]] = None) -> int:  # pylint: disable=too-many-arguments
     with out:
         for algorithm in algorithms:
-            program_retval = output_algorithm(out, alg_db, alg_type, algorithm, unknown_algs, program_retval, maxlen, alg_sizes)
+            program_retval = output_algorithm(out, alg_db, alg_type, algorithm, unknown_algs, program_retval, maxlen, host_keys=host_keys, dh_modulus_sizes=dh_modulus_sizes)
     if not out.is_section_empty() and not is_json_output:
         out.head('# ' + title)
         out.flush_section()
@@ -119,7 +131,7 @@ def output_algorithms(out: OutputBuffer, title: str, alg_db: Dict[str, Dict[str,
     return program_retval
 
 
-def output_algorithm(out: OutputBuffer, alg_db: Dict[str, Dict[str, List[List[Optional[str]]]]], alg_type: str, alg_name: str, unknown_algs: List[str], program_retval: int, alg_max_len: int = 0, alg_sizes: Optional[Dict[str, Tuple[int, int]]] = None) -> int:
+def output_algorithm(out: OutputBuffer, alg_db: Dict[str, Dict[str, List[List[Optional[str]]]]], alg_type: str, alg_name: str, unknown_algs: List[str], program_retval: int, alg_max_len: int = 0, host_keys: Optional[Dict[str, Dict[str, Union[bytes, str, int]]]] = None, dh_modulus_sizes: Optional[Dict[str, int]] = None) -> int:  # pylint: disable=too-many-arguments
     prefix = '(' + alg_type + ') '
     if alg_max_len == 0:
         alg_max_len = len(alg_name)
@@ -128,14 +140,30 @@ def output_algorithm(out: OutputBuffer, alg_db: Dict[str, Dict[str, List[List[Op
     # If this is an RSA host key or DH GEX, append the size to its name and fix
     # the padding.
     alg_name_with_size = None
-    if (alg_sizes is not None) and (alg_name in alg_sizes):
-        hostkey_size, ca_size = alg_sizes[alg_name]
-        if ca_size > 0:
-            alg_name_with_size = '%s (%d-bit cert/%d-bit CA)' % (alg_name, hostkey_size, ca_size)
+    if (dh_modulus_sizes is not None) and (alg_name in dh_modulus_sizes):
+        alg_name_with_size = '%s (%u-bit)' % (alg_name, dh_modulus_sizes[alg_name])
+        padding = padding[0:-11]
+    elif (host_keys is not None) and (alg_name in host_keys):
+        hostkey_size = cast(int, host_keys[alg_name]['hostkey_size'])
+        ca_key_type = cast(str, host_keys[alg_name]['ca_key_type'])
+        ca_key_size = cast(int, host_keys[alg_name]['ca_key_size'])
+
+        # If this is an RSA variant, just print "RSA".
+        if ca_key_type in HostKeyTest.RSA_FAMILY:
+            ca_key_type = "RSA"
+
+        if len(ca_key_type) > 0 and ca_key_size > 0:
+            alg_name_with_size = '%s (%u-bit cert/%u-bit %s CA)' % (alg_name, hostkey_size, ca_key_size, ca_key_type)
             padding = padding[0:-15]
-        else:
-            alg_name_with_size = '%s (%d-bit)' % (alg_name, hostkey_size)
+        elif alg_name in HostKeyTest.RSA_FAMILY:
+            alg_name_with_size = '%s (%u-bit)' % (alg_name, hostkey_size)
             padding = padding[0:-11]
+
+    # If this is a kex algorithm and starts with 'gss-', then normalize its name (i.e.: 'gss-gex-sha1-vz8J1E9PzLr8b1K+0remTg==' => 'gss-gex-sha1-*').  The base64 field can vary, so we'll convert it to the wildcard that our database uses and we'll just resume doing a straight match like all other algorithm names.
+    alg_name_original = alg_name
+    if alg_type == 'kex' and alg_name.startswith('gss-'):
+        last_dash = alg_name.rindex('-')
+        alg_name = "%s-*" % alg_name[0:last_dash]
 
     texts = []
     if len(alg_name.strip()) == 0:
@@ -162,8 +190,13 @@ def output_algorithm(out: OutputBuffer, alg_db: Dict[str, Dict[str, List[List[Op
         texts.append(('warn', 'unknown algorithm'))
         unknown_algs.append(alg_name)
 
+    # For kex GSS algorithms, now that we already did the database lookup (above), restore the original algorithm name so its reported properly in the output.
+    if alg_name != alg_name_original:
+        alg_name = alg_name_original
+
     alg_name = alg_name_with_size if alg_name_with_size is not None else alg_name
     first = True
+    use_good_for_all = False
     for level, text in texts:
         if level == 'fail':
             program_retval = exitcodes.FAILURE
@@ -172,9 +205,13 @@ def output_algorithm(out: OutputBuffer, alg_db: Dict[str, Dict[str, List[List[Op
 
         f = getattr(out, level)
         comment = (padding + ' -- [' + level + '] ' + text) if text != '' else ''
+
+        # If the first algorithm's comment is an 'info', this implies that it is rated good.  Hence, the out.good() function should be used to write all subsequent notes for this algorithm as well.
+        if (first and level == 'info') or use_good_for_all:
+            f = out.good
+            use_good_for_all = True
+
         if first:
-            if first and level == 'info':
-                f = out.good
             f(prefix + alg_name + comment)
             first = False
         else:  # pylint: disable=else-if-used
@@ -218,10 +255,12 @@ def output_compatibility(out: OutputBuffer, algs: Algorithms, client_audit: bool
 
 
 def output_security_sub(out: OutputBuffer, sub: str, software: Optional[Software], client_audit: bool, padlen: int) -> dict:
+
     cveVulns = {
         'critical': [],
         'warning': []
     }
+
     secdb = VersionVulnerabilityDB.CVE if sub == 'cve' else VersionVulnerabilityDB.TXT
     if software is None or software.product not in secdb:
         return
@@ -248,7 +287,6 @@ def output_security_sub(out: OutputBuffer, sub: str, software: Optional[Software
             cvss, descr = line[4:6]
 
             # Critical CVSS scores (>= 8.0) are printed as a fail, otherwise they are printed as a warning.
-            out_func = out.warn
             level = 'critical' if cvss >= 8.0 else 'warning'
             if cvss >= 8.0:
                 out_func = out.fail
@@ -257,6 +295,7 @@ def output_security_sub(out: OutputBuffer, sub: str, software: Optional[Software
         else:
             descr = line[4]
             out.fail('(sec) {}{} -- {}'.format(name, p, descr))
+
     return cveVulns
 
 
@@ -277,39 +316,38 @@ def output_security(out: OutputBuffer, banner: Optional[Banner], client_audit: b
     return cveVulns
 
 
-
 def output_fingerprints(out: OutputBuffer, algs: Algorithms, is_json_output: bool) -> None:
     with out:
-        fps = []
+        fps = {}
         if algs.ssh1kex is not None:
             name = 'ssh-rsa1'
             fp = Fingerprint(algs.ssh1kex.host_key_fingerprint_data)
             # bits = algs.ssh1kex.host_key_bits
-            fps.append((name, fp))
+            fps[name] = fp
         if algs.ssh2kex is not None:
             host_keys = algs.ssh2kex.host_keys()
             for host_key_type in algs.ssh2kex.host_keys():
                 if host_keys[host_key_type] is None:
                     continue
 
-                fp = Fingerprint(host_keys[host_key_type])
+                fp = Fingerprint(cast(bytes, host_keys[host_key_type]['raw_hostkey_bytes']))
 
                 # Workaround for Python's order-indifference in dicts.  We might get a random RSA type (ssh-rsa, rsa-sha2-256, or rsa-sha2-512), so running the tool against the same server three times may give three different host key types here.  So if we have any RSA type, we will simply hard-code it to 'ssh-rsa'.
                 if host_key_type in HostKeyTest.RSA_FAMILY:
                     host_key_type = 'ssh-rsa'
 
-                # Skip over certificate host types (or we would return invalid fingerprints).
+                # Skip over certificate host types (or we would return invalid fingerprints), and only add one fingerprint in the RSA family.
                 if '-cert-' not in host_key_type:
-                    fps.append((host_key_type, fp))
+                    fps[host_key_type] = fp
         # Similarly, the host keys can be processed in random order due to Python's order-indifference in dicts.  So we sort this list before printing; this makes automated testing possible.
-        fps = sorted(fps)
-        for fpp in fps:
-            name, fp = fpp
-            out.good('(fin) {}: {}'.format(name, fp.sha256))
+        fp_types = sorted(fps.keys())
+        for fp_type in fp_types:
+            fp = fps[fp_type]
+            out.good('(fin) {}: {}'.format(fp_type, fp.sha256))
 
             # Output the MD5 hash too if verbose mode is enabled.
             if out.verbose:
-                out.info('(fin) {}: {} -- [info] do not rely on MD5 fingerprints for server identification; it is insecure for this use case'.format(name, fp.md5))
+                out.info('(fin) {}: {} -- [info] do not rely on MD5 fingerprints for server identification; it is insecure for this use case'.format(fp_type, fp.md5))
 
     if not out.is_section_empty() and not is_json_output:
         out.head('# fingerprints')
@@ -318,7 +356,7 @@ def output_fingerprints(out: OutputBuffer, algs: Algorithms, is_json_output: boo
 
 
 # Returns True if no warnings or failures encountered in configuration.
-def output_recommendations(out: OutputBuffer, algs: Algorithms, software: Optional[Software], is_json_output: bool, padlen: int = 0) -> bool:
+def output_recommendations(out: OutputBuffer, algs: Algorithms, algorithm_recommendation_suppress_list: List[str], software: Optional[Software], is_json_output: bool, padlen: int = 0) -> bool:
 
     ret = True
     # PuTTY's algorithms cannot be modified, so there's no point in issuing recommendations.
@@ -349,35 +387,41 @@ def output_recommendations(out: OutputBuffer, algs: Algorithms, software: Option
             ret = False
         return ret
 
-    for_server = True
+    level_to_output = {
+        "informational": out.good,
+        "warning": out.warn,
+        "critical": out.fail
+    }
+
     with out:
-        software, alg_rec = algs.get_recommendations(software, for_server)
-        for sshv in range(2, 0, -1):
-            if sshv not in alg_rec:
-                continue
-            for alg_type in ['kex', 'key', 'enc', 'mac']:
-                if alg_type not in alg_rec[sshv]:
-                    continue
-                for action in ['del', 'add', 'chg']:
-                    if action not in alg_rec[sshv][alg_type]:
-                        continue
-                    for name in alg_rec[sshv][alg_type][action]:
+        recommendations = get_algorithm_recommendations(algs, algorithm_recommendation_suppress_list, software, for_server=True)
+
+        for level in recommendations:  # pylint: disable=consider-using-dict-items
+            for action in recommendations[level]:
+                for alg_type in recommendations[level][action]:
+                    for alg_name_and_notes in recommendations[level][action][alg_type]:
+                        name = alg_name_and_notes['name']
+                        notes = alg_name_and_notes['notes']
+
                         p = '' if out.batch else ' ' * (padlen - len(name))
-                        chg_additional_info = ''
+
+                        fn = level_to_output[level]
+
                         if action == 'del':
-                            an, sg, fn = 'remove', '-', out.warn
+                            an, sg = 'remove', '-'
                             ret = False
-                            if alg_rec[sshv][alg_type][action][name] >= 10:
-                                fn = out.fail
                         elif action == 'add':
-                            an, sg, fn = 'append', '+', out.good
+                            an, sg = 'append', '+'
                         elif action == 'chg':
-                            an, sg, fn = 'change', '!', out.fail
+                            an, sg = 'change', '!'
                             ret = False
-                            chg_additional_info = ' (increase modulus size to 3072 bits or larger)'
-                        b = '(SSH{})'.format(sshv) if sshv == 1 else ''
-                        fm = '(rec) {0}{1}{2}-- {3} algorithm to {4}{5} {6}'
-                        fn(fm.format(sg, name, p, alg_type, an, chg_additional_info, b))
+
+                        if notes != '':
+                            notes = " (%s)" % notes
+
+                        fm = '(rec) {0}{1}{2}-- {3} algorithm to {4}{5} '
+                        fn(fm.format(sg, name, p, alg_type, an, notes))
+
     if not out.is_section_empty() and not is_json_output:
         if software is not None:
             title = '(for {})'.format(software.display(False))
@@ -390,7 +434,7 @@ def output_recommendations(out: OutputBuffer, algs: Algorithms, software: Option
 
 
 # Output additional information & notes.
-def output_info(out: OutputBuffer, software: Optional['Software'], client_audit: bool, any_problems: bool, is_json_output: bool) -> None:
+def output_info(out: OutputBuffer, software: Optional['Software'], client_audit: bool, any_problems: bool, is_json_output: bool, additional_notes: str) -> None:
     with out:
         # Tell user that PuTTY cannot be hardened at the protocol-level.
         if client_audit and (software is not None) and (software.product == Product.PuTTY):
@@ -400,10 +444,166 @@ def output_info(out: OutputBuffer, software: Optional['Software'], client_audit:
         if any_problems:
             out.warn('(nfo) For hardening guides on common OSes, please see: <https://www.ssh-audit.com/hardening_guides.html>')
 
+        # Add any additional notes.
+        if len(additional_notes) > 0:
+            out.warn("(nfo) %s" % additional_notes)
+
     if not out.is_section_empty() and not is_json_output:
         out.head('# additional info')
         out.flush_section()
         out.sep()
+
+
+def post_process_findings(banner: Optional[Banner], algs: Algorithms, client_audit: bool) -> Tuple[List[str], str]:
+    '''Perform post-processing on scan results before reporting them to the user.  Returns a list of algorithms that should not be recommended'''
+
+    def _add_terrapin_warning(db: Dict[str, Dict[str, List[List[Optional[str]]]]], category: str, algorithm_name: str) -> None:
+        '''Adds a warning regarding the Terrapin vulnerability for the specified algorithm.'''
+        # Ensure that a slot for warnings exists for this algorithm.
+        while len(db[category][algorithm_name]) < 3:
+            db[category][algorithm_name].append([])
+
+        db[category][algorithm_name][2].append("vulnerable to the Terrapin attack (CVE-2023-48795), allowing message prefix truncation")
+
+    def _get_chacha_ciphers_enabled(algs: Algorithms) -> List[str]:
+        '''Returns a list of chacha20-poly1305 ciphers that the peer supports.'''
+        ret = []
+
+        if algs.ssh2kex is not None:
+            ciphers_supported = algs.ssh2kex.client.encryption if client_audit else algs.ssh2kex.server.encryption
+            for cipher in ciphers_supported:
+                if cipher.startswith("chacha20-poly1305"):
+                    ret.append(cipher)
+
+        return ret
+
+    def _get_chacha_ciphers_not_enabled(db: Dict[str, Dict[str, List[List[Optional[str]]]]], algs: Algorithms) -> List[str]:
+        '''Returns a list of all chacha20-poly1305 in our algorithm database.'''
+        ret = []
+
+        for cipher in db["enc"]:
+            if cipher.startswith("chacha20-poly1305") and cipher not in _get_chacha_ciphers_enabled(algs):
+                ret.append(cipher)
+
+        return ret
+
+    def _get_cbc_ciphers_enabled(algs: Algorithms) -> List[str]:
+        '''Returns a list of CBC ciphers that the peer supports.'''
+        ret = []
+
+        if algs.ssh2kex is not None:
+            ciphers_supported = algs.ssh2kex.client.encryption if client_audit else algs.ssh2kex.server.encryption
+            for cipher in ciphers_supported:
+                if cipher.endswith("-cbc") or cipher.endswith("-cbc@openssh.org") or cipher.endswith("-cbc@ssh.com") or cipher == "rijndael-cbc@lysator.liu.se":
+                    ret.append(cipher)
+
+        return ret
+
+    def _get_cbc_ciphers_not_enabled(db: Dict[str, Dict[str, List[List[Optional[str]]]]], algs: Algorithms) -> List[str]:
+        '''Returns a list of all CBC ciphers in our algorithm database.'''
+        ret = []
+
+        for cipher in db["enc"]:
+            if (cipher.endswith("-cbc") or cipher.endswith("-cbc@openssh.org") or cipher.endswith("-cbc@ssh.com") or cipher == "rijndael-cbc@lysator.liu.se") and cipher not in _get_cbc_ciphers_enabled(algs):
+                ret.append(cipher)
+
+        return ret
+
+    def _get_etm_macs_enabled(algs: Algorithms) -> List[str]:
+        '''Returns a list of ETM MACs that the peer supports.'''
+        ret = []
+
+        if algs.ssh2kex is not None:
+            macs_supported = algs.ssh2kex.client.mac if client_audit else algs.ssh2kex.server.mac
+            for mac in macs_supported:
+                if mac.endswith("-etm@openssh.com"):
+                    ret.append(mac)
+
+        return ret
+
+    def _get_etm_macs_not_enabled(db: Dict[str, Dict[str, List[List[Optional[str]]]]], algs: Algorithms) -> List[str]:
+        '''Returns a list of ETM MACs in our algorithm database.'''
+        ret = []
+
+        for mac in db["mac"]:
+            if mac.endswith("-etm@openssh.com") and mac not in _get_etm_macs_enabled(algs):
+                ret.append(mac)
+
+        return ret
+
+
+    algorithm_recommendation_suppress_list = []
+    algs_to_note = []
+
+
+    #
+    # Post-processing of the OpenSSH diffie-hellman-group-exchange-sha256 fallback mechanism bug/feature.
+    #
+
+    # If the server is OpenSSH, and the diffie-hellman-group-exchange-sha256 key exchange was found with modulus size 2048, add a note regarding the bug that causes the server to support 2048-bit moduli no matter the configuration.
+    if (algs.ssh2kex is not None and 'diffie-hellman-group-exchange-sha256' in algs.ssh2kex.kex_algorithms and 'diffie-hellman-group-exchange-sha256' in algs.ssh2kex.dh_modulus_sizes() and algs.ssh2kex.dh_modulus_sizes()['diffie-hellman-group-exchange-sha256'] == 2048) and (banner is not None and banner.software is not None and banner.software.find('OpenSSH') != -1):
+
+        # Ensure a list for notes exists.
+        db = SSH2_KexDB.get_db()
+        while len(db['kex']['diffie-hellman-group-exchange-sha256']) < 4:
+            db['kex']['diffie-hellman-group-exchange-sha256'].append([])
+
+        db['kex']['diffie-hellman-group-exchange-sha256'][3].append("A bug in OpenSSH causes it to fall back to a 2048-bit modulus regardless of server configuration (https://bugzilla.mindrot.org/show_bug.cgi?id=2793)")
+
+        # Ensure that this algorithm doesn't appear in the recommendations section since the user cannot control this OpenSSH bug.
+        algorithm_recommendation_suppress_list.append('diffie-hellman-group-exchange-sha256')
+
+    # Check for the Terrapin vulnerability (CVE-2023-48795), and mark the vulnerable algorithms.
+    kex_strict_marker = False
+    if algs.ssh2kex is not None and \
+       ((client_audit and 'kex-strict-c-v00@openssh.com' in algs.ssh2kex.kex_algorithms) or (not client_audit and 'kex-strict-s-v00@openssh.com' in algs.ssh2kex.kex_algorithms)):  # Strict KEX marker is present.
+        kex_strict_marker = True
+
+    db = SSH2_KexDB.get_db()
+
+
+    #
+    # Post-processing of algorithms related to the Terrapin vulnerability (CVE-2023-48795).
+    #
+
+    # Without the strict KEX marker, the chacha20-poly1305 ciphers are always vulnerable.
+    for chacha_cipher in _get_chacha_ciphers_enabled(algs):
+        if kex_strict_marker:
+            # Inform the user that the target is correctly configured, but another peer may still choose this algorithm without using strict KEX negotiation, which would still result in vulnerability.
+            algs_to_note.append(chacha_cipher)
+        else:
+            _add_terrapin_warning(db, "enc", chacha_cipher)
+
+    cbc_ciphers_enabled = _get_cbc_ciphers_enabled(algs)
+    etm_macs_enabled = _get_etm_macs_enabled(algs)
+
+    # Without the strict KEX marker, if at least one CBC cipher and at least one ETM MAC is supported, mark them all as vulnerable.
+    if len(cbc_ciphers_enabled) > 0 and len(etm_macs_enabled) > 0:
+        for cipher in cbc_ciphers_enabled:
+            if kex_strict_marker:
+                # Inform the user that the target is correctly configured, but another peer may still choose this algorithm without using strict KEX negotiation, which would still result in vulnerability.
+                algs_to_note.append(cipher)
+            else:
+                _add_terrapin_warning(db, "enc", cipher)
+
+        for mac in etm_macs_enabled:
+            if kex_strict_marker:
+                # Inform the user that the target is correctly configured, but another peer may still choose this algorithm without using strict KEX negotiation, which would still result in vulnerability.
+                algs_to_note.append(mac)
+            else:
+                _add_terrapin_warning(db, "mac", mac)
+
+    # Return a note telling the user that, while this target is properly configured, if connected to a vulnerable peer, then a vulnerable connection is still possible.
+    notes = ""
+    if len(algs_to_note) > 0:
+        notes = "Be aware that, while this target properly supports the strict key exchange method (via the kex-strict-?-v00@openssh.com marker) needed to protect against the Terrapin vulnerability (CVE-2023-48795), all peers must also support this feature as well, otherwise the vulnerability will still be present.  The following algorithms would allow an unpatched peer to create vulnerable SSH channels with this target: %s.  If any CBC ciphers are in this list, you may remove them while leaving the *-etm@openssh.com MACs in place; these MACs are fine while paired with non-CBC cipher types." % ", ".join(algs_to_note)
+
+    # Add the chacha ciphers, CBC ciphers, and ETM MACs to the recommendation suppression list if they are not enabled on the server.  That way they are not recommended to the user to enable if they were explicitly disabled to handle the Terrapin vulnerability.  However, they can still be recommended for disabling.
+    algorithm_recommendation_suppress_list += _get_chacha_ciphers_not_enabled(db, algs)
+    algorithm_recommendation_suppress_list += _get_cbc_ciphers_not_enabled(db, algs)
+    algorithm_recommendation_suppress_list += _get_etm_macs_not_enabled(db, algs)
+
+    return algorithm_recommendation_suppress_list, notes
 
 
 # Returns a exitcodes.* flag to denote if any failures or warnings were encountered.
@@ -413,6 +613,10 @@ def output(out: OutputBuffer, aconf: AuditConf, banner: Optional[Banner], header
     client_audit = client_host is not None  # If set, this is a client audit.
     sshv = 1 if pkm is not None else 2
     algs = Algorithms(pkm, kex)
+
+    # Perform post-processing on the findings to make final adjustments before outputting the results.
+    algorithm_recommendation_suppress_list, additional_notes = post_process_findings(banner, algs, client_audit)
+
     with out:
         if print_target:
             host = aconf.host
@@ -464,8 +668,10 @@ def output(out: OutputBuffer, aconf: AuditConf, banner: Optional[Banner], header
     cveVulns = output_security(out, banner, client_audit, maxlen, aconf.json)
     # Filled in by output_algorithms() with unidentified algs.
     unknown_algorithms: List[str] = []
+
+    # SSHv1
     if pkm is not None:
-        adb = SSH1_KexDB.ALGORITHMS
+        adb = SSH1_KexDB.get_db()
         ciphers = pkm.supported_ciphers
         auths = pkm.supported_authentications
         title, atype = 'SSH1 host-key algorithms', 'key'
@@ -474,19 +680,22 @@ def output(out: OutputBuffer, aconf: AuditConf, banner: Optional[Banner], header
         program_retval = output_algorithms(out, title, adb, atype, ciphers, unknown_algorithms, aconf.json, program_retval, maxlen)
         title, atype = 'SSH1 authentication types', 'aut'
         program_retval = output_algorithms(out, title, adb, atype, auths, unknown_algorithms, aconf.json, program_retval, maxlen)
+
+    # SSHv2
     if kex is not None:
-        adb = SSH2_KexDB.ALGORITHMS
+        adb = SSH2_KexDB.get_db()
         title, atype = 'key exchange algorithms', 'kex'
-        program_retval = output_algorithms(out, title, adb, atype, kex.kex_algorithms, unknown_algorithms, aconf.json, program_retval, maxlen, kex.dh_modulus_sizes())
+        program_retval = output_algorithms(out, title, adb, atype, kex.kex_algorithms, unknown_algorithms, aconf.json, program_retval, maxlen, dh_modulus_sizes=kex.dh_modulus_sizes())
         title, atype = 'host-key algorithms', 'key'
-        program_retval = output_algorithms(out, title, adb, atype, kex.key_algorithms, unknown_algorithms, aconf.json, program_retval, maxlen, kex.rsa_key_sizes())
+        program_retval = output_algorithms(out, title, adb, atype, kex.key_algorithms, unknown_algorithms, aconf.json, program_retval, maxlen, host_keys=kex.host_keys())
         title, atype = 'encryption algorithms (ciphers)', 'enc'
         program_retval = output_algorithms(out, title, adb, atype, kex.server.encryption, unknown_algorithms, aconf.json, program_retval, maxlen)
         title, atype = 'message authentication code algorithms', 'mac'
         program_retval = output_algorithms(out, title, adb, atype, kex.server.mac, unknown_algorithms, aconf.json, program_retval, maxlen)
+
     output_fingerprints(out, algs, aconf.json)
-    perfect_config = output_recommendations(out, algs, software, aconf.json, maxlen)
-    output_info(out, software, client_audit, not perfect_config, aconf.json)
+    perfect_config = output_recommendations(out, algs, algorithm_recommendation_suppress_list, software, aconf.json, maxlen)
+    output_info(out, software, client_audit, not perfect_config, aconf.json, additional_notes)
 
     if aconf.json:
         out.reset()
@@ -501,9 +710,11 @@ def output(out: OutputBuffer, aconf: AuditConf, banner: Optional[Banner], header
                     client_host=client_host,
                     cves=cveVulns,
                     software=software,
-                    algs=algs
+                    algorithms=algs,
+                    algorithm_recommendation_suppress_list=algorithm_recommendation_suppress_list,
+                    additional_notes=additional_notes
                 ),
-                indent=4 if aconf.json_print_indent else None, 
+                indent=4 if aconf.json_print_indent else None,
                 sort_keys=True
             )
         )
@@ -556,6 +767,55 @@ def evaluate_policy(out: OutputBuffer, aconf: AuditConf, banner: Optional['Banne
     return passed
 
 
+def get_algorithm_recommendations(algs: Optional[Algorithms], algorithm_recommendation_suppress_list: Optional[List[str]], software: Optional[Software], for_server: bool = True) -> Dict[str, Any]:
+    '''Returns the algorithm recommendations.'''
+    ret: Dict[str, Any] = {}
+
+    if algs is None or software is None:
+        return ret
+
+    software, alg_rec = algs.get_recommendations(software, for_server)
+    for sshv in range(2, 0, -1):
+        if sshv not in alg_rec:
+            continue
+        for alg_type in ['kex', 'key', 'enc', 'mac']:
+            if alg_type not in alg_rec[sshv]:
+                continue
+            for action in ['del', 'add', 'chg']:
+                if action not in alg_rec[sshv][alg_type]:
+                    continue
+
+                for name in alg_rec[sshv][alg_type][action]:
+
+                    # If this algorithm should be suppressed, skip it.
+                    if algorithm_recommendation_suppress_list is not None and name in algorithm_recommendation_suppress_list:
+                        continue
+
+                    level = 'informational'
+                    points = alg_rec[sshv][alg_type][action][name]
+                    if points >= 10:
+                        level = 'critical'
+                    elif points >= 1:
+                        level = 'warning'
+
+                    if level not in ret:
+                        ret[level] = {}
+
+                    if action not in ret[level]:
+                        ret[level][action] = {}
+
+                    if alg_type not in ret[level][action]:
+                        ret[level][action][alg_type] = []
+
+                    notes = ''
+                    if action == 'chg':
+                        notes = 'increase modulus size to 3072 bits or larger'
+
+                    ret[level][action][alg_type].append({'name': name, 'notes': notes})
+
+    return ret
+
+
 def list_policies(out: OutputBuffer) -> None:
     '''Prints a list of server & client policies.'''
 
@@ -574,6 +834,7 @@ def list_policies(out: OutputBuffer) -> None:
         out.fail("Error: no built-in policies found!")
     else:
         out.info("\nHint: Use -P and provide the full name of a policy to run a policy scan with.\n")
+        out.info("Note: the general OpenSSH policies apply to the official releases only. OS distributions may back-port changes that cause failures (for example, Debian 11 back-ported the strict KEX mode into their package of OpenSSH v8.4, whereas it was only officially added to OpenSSH v9.6 and later).  In these cases, consider creating a custom policy (-M option).\n")
     out.write()
 
 
@@ -617,6 +878,11 @@ def process_commandline(out: OutputBuffer, args: List[str], usage_cb: Callable[.
     aconf = AuditConf()
 
     enable_colors = not any(i in args for i in ['--no-colors', '-n'])
+
+    # Disable colors if the NO_COLOR environment variable is set.
+    if "NO_COLOR" in os.environ:
+        enable_colors = False
+
     aconf.colors = enable_colors
     out.use_colors = enable_colors
 
@@ -670,8 +936,15 @@ def process_commandline(out: OutputBuffer, args: List[str], usage_cb: Callable[.
             aconf.policy_file = a
         elif o in ('-T', '--targets'):
             aconf.target_file = a
+
+            # If we're on Windows, and we can't use the idna workaround, force only one thread to be used (otherwise a crash would occur).
+            # if no_idna_workaround:
+            #    print("\nWARNING: the idna module was not found on this system, thus only single-threaded scanning will be done (this is a workaround for this Windows-specific crash: https://github.com/python/cpython/issues/73474).  Multi-threaded scanning can be enabled by installing the idna module (pip install idna).\n")
+            #    aconf.threads = 1
         elif o == '--threads':
             aconf.threads = int(a)
+            # if no_idna_workaround:
+            #    aconf.threads = 1
         elif o in ('-L', '--list-policies'):
             aconf.list_policies = True
         elif o == '--lookup':
@@ -762,10 +1035,10 @@ def process_commandline(out: OutputBuffer, args: List[str], usage_cb: Callable[.
     if (aconf.policy_file is not None) and (aconf.make_policy is False):
 
         # First, see if this is a built-in policy name.  If not, assume a file path was provided, and try to load it from disk.
-        aconf.policy = Policy.load_builtin_policy(aconf.policy_file)
+        aconf.policy = Policy.load_builtin_policy(aconf.policy_file, json_output=aconf.json)
         if aconf.policy is None:
             try:
-                aconf.policy = Policy(policy_file=aconf.policy_file)
+                aconf.policy = Policy(policy_file=aconf.policy_file, json_output=aconf.json)
             except Exception as e:
                 out.fail("Error while loading policy file: %s: %s" % (str(e), traceback.format_exc()))
                 out.write()
@@ -795,8 +1068,37 @@ def build_struct(
     client_host: Optional[str] = None,
     cves: Optional[dict] = None,
     software: Optional[Software] = None,
-    algs: Algorithms = None
-    ) -> Any:
+    algorithms: Optional[Algorithms] = None,
+    algorithm_recommendation_suppress_list: Optional[List[str]] = None,
+    additional_notes: str = "") -> Any:  # pylint: disable=too-many-arguments
+
+    def fetch_notes(algorithm: str, alg_type: str) -> Dict[str, List[Optional[str]]]:
+        '''Returns a dictionary containing the messages in the "fail", "warn", and "info" levels for this algorithm.'''
+        alg_db = SSH2_KexDB.get_db()
+        alg_info = {}
+        if algorithm in alg_db[alg_type]:
+            alg_desc = alg_db[alg_type][algorithm]
+            alg_desc_len = len(alg_desc)
+
+            # If a list for the failure notes exists, add it to the return value.  Similarly, add the related lists for the warnings and informational notes.
+            if (alg_desc_len >= 2) and (len(alg_desc[1]) > 0):
+                alg_info["fail"] = alg_desc[1]
+            if (alg_desc_len >= 3) and (len(alg_desc[2]) > 0):
+                alg_info["warn"] = alg_desc[2]
+            if (alg_desc_len >= 4) and (len(alg_desc[3]) > 0):
+                alg_info["info"] = alg_desc[3]
+
+            # Add information about when this algorithm was implemented in OpenSSH/Dropbear.
+            since_text = Algorithm.get_since_text(alg_desc[0])
+            if (since_text is not None) and (len(since_text) > 0):
+                # Add the "info" key with an empty list if the if-block above didn't create it already.
+                if "info" not in alg_info:
+                    alg_info["info"] = []
+                alg_info["info"].append(since_text)
+        else:
+            alg_info["fail"] = [SSH2_KexDB.FAIL_UNKNOWN]
+
+        return alg_info
 
     banner_str = ''
     banner_protocol = None
@@ -804,7 +1106,7 @@ def build_struct(
     banner_comments = None
     if banner is not None:
         banner_str = str(banner)
-        banner_protocol = banner.protocol
+        banner_protocol = '.'.join(str(x) for x in banner.protocol)
         banner_software = banner.software
         banner_comments = banner.comments
 
@@ -829,33 +1131,61 @@ def build_struct(
         res['compression'] = kex.server.compression
 
         res['kex'] = []
-        alg_sizes = kex.dh_modulus_sizes()
+        dh_alg_sizes = kex.dh_modulus_sizes()
         for algorithm in kex.kex_algorithms:
+            alg_notes = fetch_notes(algorithm, 'kex')
             entry: Any = {
                 'algorithm': algorithm,
+                'notes': alg_notes,
             }
-            if algorithm in alg_sizes:
-                hostkey_size, ca_size = alg_sizes[algorithm]
+            if algorithm in dh_alg_sizes:
+                hostkey_size = dh_alg_sizes[algorithm]
                 entry['keysize'] = hostkey_size
-                if ca_size > 0:
-                    entry['casize'] = ca_size
             res['kex'].append(entry)
-
         res['key'] = []
-        alg_sizes = kex.rsa_key_sizes()
+        host_keys = kex.host_keys()
         for algorithm in kex.key_algorithms:
+            alg_notes = fetch_notes(algorithm, 'key')
             entry = {
                 'algorithm': algorithm,
+                'notes': alg_notes,
             }
-            if algorithm in alg_sizes:
-                hostkey_size, ca_size = alg_sizes[algorithm]
-                entry['keysize'] = hostkey_size
+            if algorithm in host_keys:
+                hostkey_info = host_keys[algorithm]
+                hostkey_size = cast(int, hostkey_info['hostkey_size'])
+
+                ca_type = ''
+                ca_size = 0
+                if 'ca_key_type' in hostkey_info:
+                    ca_type = cast(str, hostkey_info['ca_key_type'])
+                if 'ca_key_size' in hostkey_info:
+                    ca_size = cast(int, hostkey_info['ca_key_size'])
+
+                if algorithm in HostKeyTest.RSA_FAMILY or algorithm.startswith('ssh-rsa-cert-v0'):
+                    entry['keysize'] = hostkey_size
                 if ca_size > 0:
+                    entry['ca_algorithm'] = ca_type
                     entry['casize'] = ca_size
             res['key'].append(entry)
 
-        res['enc'] = kex.server.encryption
-        res['mac'] = kex.server.mac
+        res['enc'] = []
+        for algorithm in kex.server.encryption:
+            alg_notes = fetch_notes(algorithm, 'enc')
+            entry = {
+                'algorithm': algorithm,
+                'notes': alg_notes,
+            }
+            res['enc'].append(entry)
+
+        res['mac'] = []
+        for algorithm in kex.server.mac:
+            alg_notes = fetch_notes(algorithm, 'mac')
+            entry = {
+                'algorithm': algorithm,
+                'notes': alg_notes,
+            }
+            res['mac'].append(entry)
+
         res['fingerprints'] = []
         host_keys = kex.host_keys()
 
@@ -870,7 +1200,7 @@ def build_struct(
             if host_keys[host_key_type] is None:
                 continue
 
-            fp = Fingerprint(host_keys[host_key_type])
+            fp = Fingerprint(cast(bytes, host_keys[host_key_type]['raw_hostkey_bytes']))
 
             # Skip over certificate host types (or we would return invalid fingerprints).
             if '-cert-' in host_key_type:
@@ -904,6 +1234,7 @@ def build_struct(
             'fp': pkm_fp,
         }]
 
+    # Add in the CVE information.
     if cves is None:
         res['cves'] = {}
         res['cves']['critical'] = []
@@ -919,26 +1250,12 @@ def build_struct(
     else:
         res['cves'] = cves
 
-    software, alg_rec = algs.get_recommendations(software, True)
-    res['recommendations'] = {
-        'critical': {},
-        'warning': {}
-    }
+    # Add in the recommendations.
+    res['recommendations'] = get_algorithm_recommendations(algorithms, algorithm_recommendation_suppress_list, software, for_server=True)
 
-    for alg_type in ['kex', 'key', 'enc', 'mac']:
-        if alg_type in alg_rec[2]:
-            for action in ['del', 'add', 'chg']:
-                if action in alg_rec[2][alg_type]:
-                    for n in alg_rec[2][alg_type][action]:
-                        level = 'critical' if alg_rec[2][alg_type][action][n] >= 10 else 'warning'
+    # Add in the additional notes.  Currently just one string, but in the future this may grow to multiple strings.  Hence, an array is needed to prevent future schema breakage.
+    res['additional_notes'] = [additional_notes]
 
-                        if action not in res['recommendations'][level]:
-                            res['recommendations'][level][action] = {}
-
-                        if alg_type not in res['recommendations'][level][action]:
-                            res['recommendations'][level][action][alg_type] = []
-
-                        res['recommendations'][level][action][alg_type].append(n)
     return res
 
 
@@ -1014,7 +1331,7 @@ def audit(out: OutputBuffer, aconf: AuditConf, sshv: Optional[int] = None, print
         program_retval = output(out, aconf, banner, header, pkm=SSH1_PublicKeyMessage.parse(payload))
     elif sshv == 2:
         try:
-            kex = SSH2_Kex.parse(payload)
+            kex = SSH2_Kex.parse(out, payload)
         except Exception:
             out.fail("Failed to parse server's kex.  Stack trace:\n%s" % str(traceback.format_exc()))
             return exitcodes.CONNECTION_ERROR
@@ -1024,7 +1341,7 @@ def audit(out: OutputBuffer, aconf: AuditConf, sshv: Optional[int] = None, print
             if aconf.gex_test != '':
                 return run_gex_granular_modulus_size_test(out, s, kex, aconf)
             else:
-                GEXTest.run(out, s, kex)
+                GEXTest.run(out, s, banner, kex)
 
         # This is a standard audit scan.
         if (aconf.policy is None) and (aconf.make_policy is False):
@@ -1055,7 +1372,7 @@ def algorithm_lookup(out: OutputBuffer, alg_names: str) -> int:
     }
 
     algorithm_names = alg_names.split(",")
-    adb = SSH2_KexDB.ALGORITHMS
+    adb = SSH2_KexDB.get_db()
 
     # Use nested dictionary comprehension to iterate an outer dictionary where
     # each key is an alg type that consists of a value (which is itself a
@@ -1144,23 +1461,21 @@ def target_worker_thread(host: str, port: int, shared_aconf: AuditConf) -> Tuple
     return ret, string_output
 
 
-def windows_manual(out: OutputBuffer) -> int:
-    '''Prints the man page on Windows.  Returns an exitcodes.* flag.'''
+def builtin_manual(out: OutputBuffer) -> int:
+    '''Prints the man page (Docker, PyPI, Snap, and Windows builds only).  Returns an exitcodes.* flag.'''
 
-    retval = exitcodes.GOOD
 
-    if sys.platform != 'win32':
-        out.fail("The '-m' and '--manual' parameters are reserved for use on Windows only.\nUsers of other operating systems should read the man page.")
-        retval = exitcodes.FAILURE
-        return retval
+    builtin_man_page = BUILTIN_MAN_PAGE
+    if builtin_man_page == "":
+        out.fail("The '-m' and '--manual' parameters are reserved for use in Docker, PyPI, Snap,\nand Windows builds only.  Users of other platforms should read the system man\npage.")
+        return exitcodes.FAILURE
 
     # If colors are disabled, strip the ANSI color codes from the man page.
-    windows_man_page = WINDOWS_MAN_PAGE
     if not out.use_colors:
-        windows_man_page = re.sub(r'\x1b\[\d+?m', '', windows_man_page)
+        builtin_man_page = re.sub(r'\x1b\[\d+?m', '', builtin_man_page)
 
-    out.info(windows_man_page)
-    return retval
+    out.info(builtin_man_page)
+    return exitcodes.GOOD
 
 
 def get_permitted_syntax_for_gex_test() -> Dict[str, str]:
@@ -1254,7 +1569,7 @@ def main() -> int:
         # to output a plain text version of the man page.
         if (sys.platform == 'win32') and ('colorama' not in sys.modules):
             out.use_colors = False
-        retval = windows_manual(out)
+        retval = builtin_manual(out)
         out.write()
         sys.exit(retval)
 
@@ -1306,6 +1621,10 @@ def main() -> int:
 
         if aconf.json:
             print(']')
+
+        # Send notification that this thread is exiting.  This deletes the thread's local copy of the algorithm databases.
+        SSH1_KexDB.thread_exit()
+        SSH2_KexDB.thread_exit()
 
     else:  # Just a scan against a single target.
         ret = audit(out, aconf)

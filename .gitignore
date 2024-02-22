@@ -25,3 +25,4 @@ reports/
 
 # Your local server config
 servers.txt
+.vscode
